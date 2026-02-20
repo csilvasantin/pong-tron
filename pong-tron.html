@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TRON PONG</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+        }
+        canvas {
+            display: block;
+            image-rendering: pixelated;
+        }
+        #controls {
+            margin-top: 12px;
+            color: #004466;
+            font-size: 12px;
+            letter-spacing: 2px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="controls">W/S OR ↑/↓ TO MOVE &nbsp;|&nbsp; P TO PAUSE &nbsp;|&nbsp; FIRST TO 7 WINS</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+// ── Dimensions ────────────────────────────────────────────────────────────────
+const W = 900, H = 600;
+canvas.width  = W;
+canvas.height = H;
+
+// Scale canvas to fit viewport
+function resize() {
+    const scale = Math.min(window.innerWidth / W, (window.innerHeight - 40) / H);
+    canvas.style.width  = (W * scale) + 'px';
+    canvas.style.height = (H * scale) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Palette ───────────────────────────────────────────────────────────────────
+const C = {
+    bg:      '#000000',
+    grid:    '#001a2e',
+    cyan:    '#00e5ff',
+    orange:  '#ff6a00',
+    white:   '#ffffff',
+    mid:     '#002233',
+};
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+
+function beep(freq, dur, vol = 0.25, type = 'square') {
+    const osc  = AC.createOscillator();
+    const gain = AC.createGain();
+    osc.connect(gain);
+    gain.connect(AC.destination);
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, AC.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+    osc.start();
+    osc.stop(AC.currentTime + dur);
+}
+const sndPaddle = () => beep(480, 0.08);
+const sndWall   = () => beep(220, 0.07);
+const sndScore  = () => { beep(880, 0.15); setTimeout(() => beep(660, 0.2), 120); };
+const sndWin    = () => { [880,1100,1320,1760].forEach((f,i) => setTimeout(() => beep(f, 0.3), i*120)); };
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const PW = 12, PH = 90, PM = 22, PSPEED = 6;
+const BSIZE = 8, BSPEED0 = 5.5, BSPEED_MAX = 14;
+const WIN  = 7;
+const TRAIL_LEN = 22;
+const AI_SPEED  = 4.6;
+const AI_ERR    = 28; // pixels of deliberate imprecision
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = 'start'; // start | playing | paused | over
+let score = { p1: 0, cpu: 0 };
+let flash = { timer: 0, color: C.cyan };
+let aiTarget = H / 2;
+
+const p1 = { x: PM, y: H/2 - PH/2, w: PW, h: PH, col: C.cyan };
+const ai = { x: W - PM - PW, y: H/2 - PH/2, w: PW, h: PH, col: C.orange };
+
+const ball = {
+    x: W/2, y: H/2,
+    dx: BSPEED0, dy: 2,
+    r: BSIZE,
+    trail: [],
+    speed() { return Math.hypot(this.dx, this.dy); }
+};
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (state === 'start'   && e.key === ' ')  startGame();
+    if (state === 'playing' && e.key.toLowerCase() === 'p') state = 'paused';
+    else if (state === 'paused'  && e.key.toLowerCase() === 'p') state = 'playing';
+    if (state === 'over'    && e.key === ' ')  newGame();
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// ── Game logic ────────────────────────────────────────────────────────────────
+function launchBall(dir = null) {
+    ball.x = W / 2; ball.y = H / 2;
+    ball.trail = [];
+    const d = dir ?? (Math.random() < 0.5 ? 1 : -1);
+    const ang = (Math.random() * 40 - 20) * Math.PI / 180;
+    ball.dx = d * BSPEED0 * Math.cos(ang);
+    ball.dy = BSPEED0 * Math.sin(ang);
+    updateAITarget();
+}
+
+function startGame() {
+    AC.resume();
+    state = 'playing';
+    launchBall();
+}
+
+function newGame() {
+    score.p1 = 0; score.cpu = 0;
+    p1.y = ai.y = H/2 - PH/2;
+    startGame();
+}
+
+function updateAITarget() {
+    // Predict where ball will cross AI's x line
+    if (ball.dx > 0) {
+        let bx = ball.x, by = ball.y, bdx = ball.dx, bdy = ball.dy;
+        let steps = 0;
+        while (bx < ai.x && steps < 1000) {
+            bx += bdx; by += bdy; steps++;
+            if (by < 0)   { by = -by;     bdy = -bdy; }
+            if (by > H)   { by = 2*H-by;  bdy = -bdy; }
+        }
+        // Add deliberate error
+        aiTarget = by + (Math.random() * AI_ERR * 2 - AI_ERR);
+    } else {
+        // Ball going away — drift to center
+        aiTarget = H / 2 + (Math.random() * AI_ERR * 2 - AI_ERR);
+    }
+}
+
+function update() {
+    if (state !== 'playing') return;
+
+    // ── Player ──
+    const up   = keys['w'] || keys['W'] || keys['ArrowUp'];
+    const down = keys['s'] || keys['S'] || keys['ArrowDown'];
+    if (up)   p1.y -= PSPEED;
+    if (down) p1.y += PSPEED;
+    p1.y = Math.max(0, Math.min(H - p1.h, p1.y));
+
+    // ── AI ──
+    const aiCenter = ai.y + ai.h / 2;
+    if (Math.abs(aiTarget - aiCenter) > 3) {
+        ai.y += aiTarget > aiCenter ? Math.min(AI_SPEED, aiTarget - aiCenter)
+                                    : Math.max(-AI_SPEED, aiTarget - aiCenter);
+    }
+    ai.y = Math.max(0, Math.min(H - ai.h, ai.y));
+
+    // ── Ball trail ──
+    ball.trail.push({ x: ball.x, y: ball.y });
+    if (ball.trail.length > TRAIL_LEN) ball.trail.shift();
+
+    // ── Ball move ──
+    ball.x += ball.dx;
+    ball.y += ball.dy;
+
+    // ── Wall bounce ──
+    if (ball.y - ball.r < 0)  { ball.y = ball.r;    ball.dy = Math.abs(ball.dy);  sndWall(); }
+    if (ball.y + ball.r > H)  { ball.y = H - ball.r; ball.dy = -Math.abs(ball.dy); sndWall(); }
+
+    // ── Paddle hit helper ──
+    function paddleHit(pad, newDirSign) {
+        const rel = (ball.y - (pad.y + pad.h / 2)) / (pad.h / 2); // -1..1
+        const ang = rel * 60 * Math.PI / 180;
+        const spd = Math.min(ball.speed() + 0.4, BSPEED_MAX);
+        ball.dx = newDirSign * spd * Math.cos(ang);
+        ball.dy = spd * Math.sin(ang);
+        sndPaddle();
+        flash.timer = 6; flash.color = pad.col;
+        updateAITarget();
+    }
+
+    // ── p1 paddle ──
+    if (ball.dx < 0 &&
+        ball.x - ball.r <= p1.x + p1.w && ball.x - ball.r >= p1.x - 2 &&
+        ball.y >= p1.y - ball.r && ball.y <= p1.y + p1.h + ball.r) {
+        ball.x = p1.x + p1.w + ball.r;
+        paddleHit(p1, 1);
+    }
+
+    // ── AI paddle ──
+    if (ball.dx > 0 &&
+        ball.x + ball.r >= ai.x && ball.x + ball.r <= ai.x + ai.w + 2 &&
+        ball.y >= ai.y - ball.r && ball.y <= ai.y + ai.h + ball.r) {
+        ball.x = ai.x - ball.r;
+        paddleHit(ai, -1);
+    }
+
+    // ── Scoring ──
+    if (ball.x < -ball.r * 4) {
+        score.cpu++;
+        sndScore();
+        if (score.cpu >= WIN) { state = 'over'; sndWin(); }
+        else launchBall(1);
+    }
+    if (ball.x > W + ball.r * 4) {
+        score.p1++;
+        sndScore();
+        if (score.p1 >= WIN) { state = 'over'; sndWin(); }
+        else launchBall(-1);
+    }
+
+    if (flash.timer > 0) flash.timer--;
+}
+
+// ── Drawing helpers ───────────────────────────────────────────────────────────
+function glow(color, blur = 18) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function noGlow() { ctx.shadowBlur = 0; }
+
+function drawGrid() {
+    ctx.save();
+    ctx.strokeStyle = C.grid;
+    ctx.lineWidth = 1;
+    const g = 45;
+    for (let x = 0; x <= W; x += g) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y <= H; y += g) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    ctx.restore();
+}
+
+function drawCenter() {
+    ctx.save();
+    ctx.strokeStyle = C.mid;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([14, 14]);
+    ctx.beginPath(); ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+}
+
+function drawPaddle(p) {
+    ctx.save();
+    glow(p.col, 24);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(p.x, p.y, p.w, p.h);
+    // Bright center stripe
+    glow(C.white, 6);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillRect(p.x + p.w * 0.3, p.y + 4, p.w * 0.4, p.h - 8);
+    noGlow();
+    ctx.restore();
+}
+
+function drawBall() {
+    ctx.save();
+    // Trail
+    for (let i = 0; i < ball.trail.length; i++) {
+        const t   = i / ball.trail.length;
+        const pt  = ball.trail[i];
+        const r   = ball.r * 0.9 * t;
+        glow(C.cyan, 12 * t);
+        ctx.fillStyle = `rgba(0,220,255,${t * 0.55})`;
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    // Core
+    glow(C.white, 30);
+    ctx.fillStyle = C.white;
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2); ctx.fill();
+    // Inner glow ring
+    glow(C.cyan, 10);
+    ctx.strokeStyle = C.cyan;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r * 1.6, 0, Math.PI * 2); ctx.stroke();
+    noGlow();
+    ctx.restore();
+}
+
+function drawScore() {
+    ctx.save();
+    ctx.font = 'bold 72px "Courier New"';
+    ctx.textAlign = 'right';
+    glow(C.cyan, 20); ctx.fillStyle = C.cyan;
+    ctx.fillText(score.p1, W/2 - 50, 90);
+    ctx.textAlign = 'left';
+    glow(C.orange, 20); ctx.fillStyle = C.orange;
+    ctx.fillText(score.cpu, W/2 + 50, 90);
+    // Labels
+    ctx.font = '13px "Courier New"';
+    ctx.letterSpacing = '3px';
+    glow(C.cyan, 8); ctx.fillStyle = C.cyan;
+    ctx.textAlign = 'right';
+    ctx.fillText('PLAYER', W/2 - 52, 110);
+    glow(C.orange, 8); ctx.fillStyle = C.orange;
+    ctx.textAlign = 'left';
+    ctx.fillText('CPU', W/2 + 52, 110);
+    noGlow();
+    ctx.restore();
+}
+
+function drawFlash() {
+    if (flash.timer <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = (flash.timer / 6) * 0.12;
+    ctx.fillStyle = flash.color;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+}
+
+function drawOverlay(lines, colors) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.68)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Decorative border box
+    const bx = W/2 - 300, by = H/2 - 120, bw = 600, bh = 240;
+    ctx.strokeStyle = C.cyan;
+    ctx.lineWidth = 2;
+    glow(C.cyan, 18);
+    ctx.strokeRect(bx, by, bw, bh);
+    // Corner accents
+    const cs = 20;
+    [[bx,by],[bx+bw,by],[bx,by+bh],[bx+bw,by+bh]].forEach(([cx,cy]) => {
+        ctx.fillStyle = C.cyan;
+        ctx.fillRect(cx - 4, cy - 4, 8, 8);
+    });
+
+    lines.forEach((txt, i) => {
+        ctx.font = i === 0 ? 'bold 60px "Courier New"' : '22px "Courier New"';
+        ctx.textAlign = 'center';
+        const col = colors[i] || C.cyan;
+        glow(col, i === 0 ? 28 : 12);
+        ctx.fillStyle = col;
+        ctx.fillText(txt, W/2, H/2 - 40 + i * 64);
+    });
+    noGlow();
+    ctx.restore();
+}
+
+function drawStartScreen() {
+    // Animated title glow pulse
+    const pulse = 0.7 + 0.3 * Math.sin(Date.now() / 500);
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.font = 'bold 96px "Courier New"';
+    ctx.textAlign = 'center';
+    glow(C.cyan, 40 * pulse); ctx.fillStyle = C.cyan;
+    ctx.fillText('TRON', W/2 - 120, H/2 - 60);
+    glow(C.orange, 40 * pulse); ctx.fillStyle = C.orange;
+    ctx.fillText('PONG', W/2 + 120, H/2 - 60);
+
+    ctx.font = 'bold 22px "Courier New"';
+    glow(C.white, 10 * pulse); ctx.fillStyle = C.white;
+    ctx.fillText('PRESS  SPACE  TO  START', W/2, H/2 + 40);
+
+    ctx.font = '14px "Courier New"';
+    glow(C.cyan, 8); ctx.fillStyle = '#006688';
+    ctx.fillText('W / S  or  ↑ / ↓   to move your paddle', W/2, H/2 + 90);
+    noGlow();
+    ctx.restore();
+}
+
+function drawGameOver() {
+    const win  = score.p1 >= WIN;
+    const col  = win ? C.cyan : C.orange;
+    const who  = win ? 'PLAYER WINS' : 'CPU  WINS';
+    drawOverlay([who, 'SPACE TO PLAY AGAIN'], [col, C.white]);
+}
+
+function drawPauseScreen() {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = 'bold 72px "Courier New"';
+    ctx.textAlign = 'center';
+    glow(C.cyan, 30);
+    ctx.fillStyle = C.cyan;
+    ctx.fillText('PAUSED', W/2, H/2 + 24);
+    ctx.font = '18px "Courier New"';
+    ctx.fillStyle = C.white;
+    ctx.shadowBlur = 0;
+    ctx.fillText('P  TO  RESUME', W/2, H/2 + 70);
+    noGlow();
+    ctx.restore();
+}
+
+// ── Scanline overlay ──────────────────────────────────────────────────────────
+function drawScanlines() {
+    ctx.save();
+    ctx.globalAlpha = 0.045;
+    ctx.fillStyle = '#000';
+    for (let y = 0; y < H; y += 3) {
+        ctx.fillRect(0, y, W, 1);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+}
+
+// ── Main loop ─────────────────────────────────────────────────────────────────
+function draw() {
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    drawGrid();
+    drawCenter();
+    drawFlash();
+
+    if (state !== 'start') {
+        drawScore();
+        drawPaddle(p1);
+        drawPaddle(ai);
+        drawBall();
+    }
+
+    if (state === 'start')   drawStartScreen();
+    if (state === 'paused')  drawPauseScreen();
+    if (state === 'over')    drawGameOver();
+
+    drawScanlines();
+}
+
+function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
